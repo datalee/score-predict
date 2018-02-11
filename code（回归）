@@ -1,0 +1,111 @@
+library(stringi)
+library(text2vec)
+library(data.table)
+library(magrittr)
+library(purrr)
+library(xgboost)
+library(jiebaR)
+library(readxl)
+#读取数据
+
+train <- read_xlsx("./data/train.xlsx")
+test <- read_xlsx("./data/test.xlsx")
+word_all <- rbind(train[,1:2], test)
+
+#使用全切模式full，定义一个切词引擎
+cutter <- worker(type = "full",bylines = T,stop_word = "d:/stop_words.utf8")
+cutter$write = "NOFILE"
+#对评论comment进行分词
+all_words <- sapply(word_all$Discuss, function(x) cutter <= x)
+
+# 定义预处理函数以及 tokenization 函数
+prep_fun = tolower
+tok_fun = word_tokenizer
+
+it_token = itoken(all_words,
+                  preprocessor = prep_fun,
+                  tokenizer = tok_fun,
+                  ids = word_all$Id,
+                  progressbar = T)
+vocab = create_vocabulary(it_token)
+
+bigram_vectorizer = vocab_vectorizer(vocab)
+dtm_token = create_dtm(it_token, bigram_vectorizer)
+
+#加入tf-idf特征
+# 定义模型
+tfidf = TfIdf$new()
+lsa = LSA$new(n_topics = 20)
+dtm_token_tfidf_lsa = fit_transform(dtm_token, tfidf) %>%
+  fit_transform(lsa)
+#添加lsa特征
+add.lsa <- function(m, lsa) {
+  l <- fit_transform(m, lsa)
+  colnames(l) <- ncol(l) %>% seq() %>% paste0("lsa.", .)
+  cbind2(m, l)
+}
+
+
+###############################
+###划分验证集和训练集
+###############################
+library(caret)
+set.seed(2018)
+sample_index <- createDataPartition(train$Score,p=0.85,list = F)
+sample.train <- dtm_token[1:100000,][sample_index[,1],]
+sample.val <- dtm_token[1:100000,][-sample_index[,1],]
+
+dtrain <- sample.train %>%
+  transform(tfidf) %>%
+  add.lsa(lsa) %>%
+  xgb.DMatrix(label = train$Score[sample_index])
+
+
+dval <- sample.val %>%
+  transform(tfidf) %>%
+  add.lsa(lsa) %>%
+  xgb.DMatrix(label = train$Score[-sample_index])
+
+
+watchlist <- list(val = dval, train = dtrain)
+
+# dtrain <- dtm_token[1:100000,] %>% 
+#   transform(tfidf) %>% 
+#   add.lsa(lsa) %>% 
+#   xgb.DMatrix(label = train$Score)
+param <- list(  objective           = "reg:linear", 
+                booster             = "gbtree",
+                eta                 = 0.1,
+                max_depth           = 10, #8
+                subsample           = 0.95,
+                colsample_bytree    = 0.85,
+                #num_class           = 7
+                L1                  = 100
+)
+
+
+# param <- list(max_depth = 20, eta = 0.1, objective = "multi:softmax", eval_metric = "merror", nthread = 4, num_class = 6, verbose = 2)
+# bst <- xgb.train(param, dtrain, nrounds = 500)
+bst <- xgb.train( params              = param, 
+                  data                = dtrain, 
+                  nrounds             = 2000,
+                  #early_stopping_rounds    = 200,
+                  watchlist           = watchlist,
+                  maximize            = TRUE,
+                  eval_metric         = "rmse",
+                  print_every_n       = 10
+                  )
+
+
+
+
+####################################
+##########预测
+####################################
+dtest <- dtm_token[100001:130000,] %>% 
+  transform(tfidf) %>% 
+  add.lsa(lsa)
+
+pre <- predict(bst,dtest,ntreelimit = 700)
+result <- data.frame(ID = test$Id, Score = pre, stringsAsFactors = F)
+write.csv(result,"result_0210.csv",row.names = F)
